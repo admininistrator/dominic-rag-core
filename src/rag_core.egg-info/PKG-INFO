@@ -1,0 +1,5 @@
+Metadata-Version: 2.4
+Name: rag-core
+Version: 0.1.0
+Summary: Reusable RAG primitives extracted from DominicBE
+Requires-Python: >=3.10

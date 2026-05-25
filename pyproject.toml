@@ -1,0 +1,12 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rag-core"
+version = "0.1.0"
+description = "Reusable RAG primitives extracted from DominicBE"
+requires-python = ">=3.10"
+
+[tool.setuptools.packages.find]
+where = ["src"]
