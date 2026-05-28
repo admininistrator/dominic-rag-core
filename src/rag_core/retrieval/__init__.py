@@ -21,6 +21,15 @@ from rag_core.retrieval.evidence import (
     _estimate_token_count,
     _is_embedding_compatible,
 )
+from rag_core.retrieval.section_retrieval import (
+    SECTION_CONFIDENCE_THRESHOLD,
+    SectionIntent,
+    SectionMatch,
+    detect_context_expansion_intent,
+    detect_section_query_intent,
+    format_section_context,
+    match_section,
+)
 
 __all__ = [
     "QUERY_EXPANSION_RULES",
@@ -38,4 +47,11 @@ __all__ = [
     "_classify_evidence_strength",
     "_estimate_token_count",
     "_is_embedding_compatible",
+    "SECTION_CONFIDENCE_THRESHOLD",
+    "SectionIntent",
+    "SectionMatch",
+    "detect_context_expansion_intent",
+    "detect_section_query_intent",
+    "format_section_context",
+    "match_section",
 ]

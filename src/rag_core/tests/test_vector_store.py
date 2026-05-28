@@ -9,6 +9,9 @@ Covers:
 """
 from __future__ import annotations
 
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
 from rag_core.vector_store.base import VectorStore, VectorStoreError
 from rag_core.vector_store.qdrant_adapter import QdrantAdapter
 from rag_core.vector_store.types import VectorPayload, VectorSearchResult, VectorStoreHealth
@@ -253,3 +256,58 @@ class TestQdrantAdapter:
         adapter = QdrantAdapter()
         # Should not raise
         adapter.delete_document_chunks("user1", 42)
+
+    def test_search_uses_query_points_and_preserves_session_filters(self):
+        adapter = QdrantAdapter(
+            collection="knowledge_chunks",
+            url="http://localhost:6333",
+        )
+        point = SimpleNamespace(
+            id=11,
+            score=0.88,
+            payload={"chunk_id": 11, "document_id": 7},
+        )
+        mock_client = MagicMock()
+        mock_client.query_points.return_value = SimpleNamespace(points=[point])
+        mock_client.search.side_effect = AssertionError("search should not be called")
+
+        with patch.object(adapter, "_get_client", return_value=mock_client):
+            results = adapter.search_similar_chunks(
+                "alice",
+                [0.1, 0.2, 0.3],
+                top_k=3,
+                session_id=42,
+                session_scope="session",
+            )
+
+        assert results == [
+            {
+                "chunk_id": 11,
+                "document_id": 7,
+                "score": 0.88,
+                "vector_id": "11",
+            }
+        ]
+        mock_client.search.assert_not_called()
+        kwargs = mock_client.query_points.call_args.kwargs
+        assert kwargs["collection_name"] == "knowledge_chunks"
+        assert kwargs["query"] == [0.1, 0.2, 0.3]
+        assert kwargs["limit"] == 3
+        assert kwargs["with_payload"] is True
+        assert kwargs["with_vectors"] is False
+        conditions = {
+            condition.key: condition.match.value
+            for condition in kwargs["query_filter"].must
+        }
+        assert conditions == {
+            "owner_username": "alice",
+            "session_scope": "session",
+            "session_id": 42,
+        }
+
+    def test_query_points_result_normalizer_accepts_points_and_list(self):
+        point = SimpleNamespace(id=11, score=0.88, payload={})
+        assert QdrantAdapter._normalize_query_points_result(
+            SimpleNamespace(points=[point])
+        ) == [point]
+        assert QdrantAdapter._normalize_query_points_result([point]) == [point]

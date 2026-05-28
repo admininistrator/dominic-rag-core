@@ -310,28 +310,42 @@ class QdrantAdapter:
                 )
             )
 
-        points = client.search(
+        response = client.query_points(
             collection_name=self._collection,
-            query_vector=query_vector,
+            query=query_vector,
             query_filter=models.Filter(must=must_conditions),
             limit=top_k,
             with_payload=True,
             with_vectors=False,
         )
+        points = self._normalize_query_points_result(response)
 
-        return [
-            {
-                "chunk_id": int(point.payload.get("chunk_id") or point.id),
-                "document_id": int(point.payload.get("document_id")),
-                "score": float(point.score or 0.0),
-                "vector_id": str(point.id),
-            }
-            for point in points
-        ]
+        results: list[dict[str, Any]] = []
+        for point in points:
+            payload = dict(getattr(point, "payload", None) or {})
+            results.append(
+                {
+                    "chunk_id": int(payload.get("chunk_id") or point.id),
+                    "document_id": int(payload.get("document_id")),
+                    "score": float(getattr(point, "score", None) or 0.0),
+                    "vector_id": str(point.id),
+                }
+            )
+        return results
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _normalize_query_points_result(response: Any) -> list[Any]:
+        """Return point objects from Qdrant query responses across client versions."""
+        points = getattr(response, "points", None)
+        if points is not None:
+            return list(points)
+        if isinstance(response, list):
+            return response
+        return list(response)
 
     @lru_cache  # noqa: B019
     def _get_client(self):

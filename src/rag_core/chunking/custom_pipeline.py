@@ -17,6 +17,10 @@ from __future__ import annotations
 import logging
 
 from rag_core.chunking.base import IngestionChunk, IngestionPipelineError
+from rag_core.chunking.heading_detector import detect_headings, heading_for_offset
+from rag_core.chunking.page_markers import page_metadata_for_span, strip_page_markers
+from rag_core.chunking.span_mapper import map_chunks_monotonic
+from rag_core.parsing.text_normalizer import normalize_text_for_ingestion
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +33,10 @@ class CustomPipeline:
 
     Delegates to ``rag_core.chunking.sentence_chunker.chunk_text()``.
     """
+
+    def __init__(self, *, chunk_size: int | None = None, chunk_overlap: int | None = None) -> None:
+        self._chunk_size = chunk_size
+        self._chunk_overlap = chunk_overlap
 
     # IngestionPipeline protocol properties
     @property
@@ -68,12 +76,34 @@ class CustomPipeline:
                 category="import_error",
             ) from exc
 
-        raw_chunks = chunk_text(text)
+        cleaned_text, page_markers = strip_page_markers(text)
+        source_text = normalize_text_for_ingestion(cleaned_text or text)
+        raw_chunks = chunk_text(
+            source_text,
+            chunk_size=self._chunk_size,
+            chunk_overlap=self._chunk_overlap,
+        )
+        spans = map_chunks_monotonic(source_text, [raw.get("content", "") for raw in raw_chunks])
+        headings = detect_headings(source_text)
 
         chunks: list[IngestionChunk] = []
-        for raw in raw_chunks:
+        for raw, span in zip(raw_chunks, spans):
             raw_meta = dict(raw.get("metadata_json") or {})
             raw_meta.pop("char_count", None)
+            if span.char_start is not None:
+                raw_meta["char_start"] = span.char_start
+            if span.char_end is not None:
+                raw_meta["char_end"] = span.char_end
+
+            page_meta = page_metadata_for_span(page_markers, span.char_start, span.char_end)
+            raw_meta.update(page_meta)
+
+            heading = heading_for_offset(headings, span.char_start)
+            if heading is not None:
+                raw_meta.setdefault("section_key", heading.section_key)
+                raw_meta.setdefault("section_title", heading.title)
+                raw_meta.setdefault("section_level", heading.level)
+                raw_meta.setdefault("section_order", heading.section_order)
 
             chunks.append(
                 IngestionChunk(

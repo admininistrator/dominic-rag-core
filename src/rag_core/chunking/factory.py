@@ -53,7 +53,10 @@ def get_ingestion_pipeline(
         from rag_core.chunking.custom_pipeline import CustomPipeline
 
         logger.debug("get_ingestion_pipeline: returning CustomPipeline")
-        return CustomPipeline()
+        return CustomPipeline(
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+        )
 
     if selected == _PIPELINE_LLAMAINDEX:
         try:
