@@ -146,6 +146,33 @@ class TestBuildEvidenceContext:
         assert "[Source 1]" in context
         assert "type=web" in context
 
+    def test_table_evidence_preserves_citation_metadata_and_markdown(self):
+        results = [
+            {
+                "document_id": 10,
+                "chunk_id": 700,
+                "title": "Revenue table",
+                "score": 0.75,
+                "source_type": "table",
+                "table_id": "tbl-revenue-2026",
+                "page_number": 4,
+                "section_key": "finance.revenue",
+                "text_summary": "Table Revenue with 3 rows and 3 columns.",
+                "markdown_table": "| Quarter | Revenue | Margin |\n| --- | --- | --- |\n| Q2 | $1.5M | 44% |",
+            }
+        ]
+
+        context = _build_evidence_context(results)
+
+        assert "[Source 1] type=table" in context
+        assert "document_id=10" in context
+        assert "chunk_id=700" in context
+        assert "table_id=tbl-revenue-2026" in context
+        assert "page_number=4" in context
+        assert "section_key=finance.revenue" in context
+        assert "Table summary: Table Revenue with 3 rows and 3 columns." in context
+        assert "| Q2 | $1.5M | 44% |" in context
+
 
 # ---------------------------------------------------------------------------
 # Retrieval packing tests

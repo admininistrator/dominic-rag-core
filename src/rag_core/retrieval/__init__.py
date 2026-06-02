@@ -30,6 +30,25 @@ from rag_core.retrieval.section_retrieval import (
     format_section_context,
     match_section,
 )
+from rag_core.retrieval.contracts import (
+    CandidateRetriever,
+    DenseRetriever,
+    FusionStrategy,
+    Reranker,
+    RetrievalCandidate,
+    RetrievalCandidatePackage,
+    RetrievalFilters,
+    RetrievalMetadata,
+    RetrievalPipeline,
+    RetrievalQuery,
+    RetrievalStageTrace,
+    SparseRetriever,
+    normalize_retrieval_metadata,
+)
+from rag_core.retrieval.fusion import ReciprocalRankFusionStrategy
+from rag_core.retrieval.reranking import ProviderReranker, RerankProviderResult, RerankerProvider
+from rag_core.retrieval.sparse import LexicalCorpusRetriever
+from rag_core.retrieval.table import TableCorpusRetriever, TableQueryRoute, route_table_aware_query
 
 __all__ = [
     "QUERY_EXPANSION_RULES",
@@ -54,4 +73,25 @@ __all__ = [
     "detect_section_query_intent",
     "format_section_context",
     "match_section",
+    "CandidateRetriever",
+    "DenseRetriever",
+    "FusionStrategy",
+    "Reranker",
+    "RetrievalCandidate",
+    "RetrievalCandidatePackage",
+    "RetrievalFilters",
+    "RetrievalMetadata",
+    "RetrievalPipeline",
+    "RetrievalQuery",
+    "RetrievalStageTrace",
+    "SparseRetriever",
+    "ReciprocalRankFusionStrategy",
+    "ProviderReranker",
+    "RerankProviderResult",
+    "RerankerProvider",
+    "LexicalCorpusRetriever",
+    "TableCorpusRetriever",
+    "TableQueryRoute",
+    "route_table_aware_query",
+    "normalize_retrieval_metadata",
 ]

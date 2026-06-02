@@ -121,6 +121,8 @@ class RetrievalRankRequest(BaseModel):
     query_expansions: list[str] = Field(default_factory=list)
     semantic_scores_by_chunk_id: dict[str, float] = Field(default_factory=dict)
     embedding_meta: EmbeddingMetaPayload | None = None
+    retrieval_config: dict[str, Any] = Field(default_factory=dict)
+    trace_id: str | None = None
 
 
 class RetrievalRankResponse(BaseModel):
@@ -133,6 +135,8 @@ class RetrievalRankResponse(BaseModel):
     evidence_strength: str
     embedding_meta: EmbeddingMetaPayload
     mixed_space_skip_count: int = 0
+    retrieval_config: dict[str, Any] = Field(default_factory=dict)
+    retrieval_traces: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class ContextPackRequest(BaseModel):

@@ -102,6 +102,134 @@ def test_retrieval_rank_endpoint(monkeypatch):
     assert data["matched_count"] == 1
 
 
+def test_retrieval_rank_endpoint_emits_pipeline_config_and_traces(monkeypatch):
+    client = _client(monkeypatch)
+    response = client.post(
+        "/v1/retrieval/rank",
+        headers=_headers(),
+        json={
+            "query": "refund policy",
+            "top_k": 2,
+            "semantic_scores_by_chunk_id": {"10": 0.9},
+            "retrieval_config": {
+                "retrieval_mode": "vector",
+                "enable_reranker": True,
+                "dense_top_k": 5,
+                "sparse_top_k": 5,
+                "fusion_top_k": 5,
+                "rerank_top_k": 2,
+            },
+            "trace_id": "trace-api-1",
+            "candidates": [
+                {
+                    "chunk_id": 10,
+                    "document_id": 1,
+                    "chunk_index": 0,
+                    "title": "Policy",
+                    "source_type": "text",
+                    "source_uri": None,
+                    "content": "The refund policy allows refunds within 30 days.",
+                    "token_count": 10,
+                    "vector_id": "local:1:0:abc",
+                    "embedding_model": "local-hash-v1",
+                    "metadata_json": {},
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["retrieval_config"]["retrieval_mode"] == "vector"
+    assert data["retrieval_config"]["trace_id"] == "trace-api-1"
+    assert [trace["stage"] for trace in data["retrieval_traces"]] == ["dense"]
+    assert data["results"][0]["source_stage"] == "dense"
+
+
+def test_retrieval_rank_hybrid_mode_does_not_enable_reranker_by_default(monkeypatch):
+    client = _client(monkeypatch)
+    response = client.post(
+        "/v1/retrieval/rank",
+        headers=_headers(),
+        json={
+            "query": "refund policy",
+            "top_k": 2,
+            "semantic_scores_by_chunk_id": {"10": 0.9},
+            "retrieval_config": {"retrieval_mode": "hybrid"},
+            "candidates": [
+                {
+                    "chunk_id": 10,
+                    "document_id": 1,
+                    "chunk_index": 0,
+                    "title": "Policy",
+                    "source_type": "text",
+                    "source_uri": None,
+                    "content": "The refund policy allows refunds within 30 days.",
+                    "token_count": 10,
+                    "vector_id": "local:1:0:abc",
+                    "embedding_model": "local-hash-v1",
+                    "metadata_json": {},
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["retrieval_config"]["retrieval_mode"] == "hybrid"
+    assert data["retrieval_config"]["enable_reranker"] is False
+    assert [trace["stage"] for trace in data["retrieval_traces"]] == ["dense", "sparse", "fusion"]
+
+
+def test_retrieval_rank_endpoint_emits_normalized_metadata(monkeypatch):
+    client = _client(monkeypatch)
+    response = client.post(
+        "/v1/retrieval/rank",
+        headers=_headers(),
+        json={
+            "query": "refund policy",
+            "top_k": 1,
+            "semantic_scores_by_chunk_id": {"11": 0.9},
+            "candidates": [
+                {
+                    "chunk_id": 11,
+                    "document_id": 2,
+                    "chunk_index": 1,
+                    "title": "Policy",
+                    "source_type": "pdf",
+                    "source_uri": "file://policy.pdf",
+                    "content": "Refund policy metadata test.",
+                    "metadata_json": {
+                        "page_number": 8,
+                        "section_key": "returns",
+                        "char_start": 20,
+                        "char_end": 80,
+                        "fallback_reason": "none",
+                        "rag_mode": "hybrid_rerank",
+                        "retrieval_scope": "session",
+                        "selected_document_id": 2,
+                        "session_id": 123,
+                        "future_field": "preserved",
+                    },
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    result = response.json()["results"][0]
+    assert result["page_number"] == 8
+    assert result["section_key"] == "returns"
+    assert result["char_start"] == 20
+    assert result["char_end"] == 80
+    assert result["fallback_reason"] == "none"
+    assert result["rag_mode"] == "hybrid_rerank"
+    assert result["retrieval_scope"] == "session"
+    assert result["selected_document_id"] == 2
+    assert result["session_id"] == 123
+    assert result["metadata_extra"] == {"future_field": "preserved"}
+
+
 def test_vector_endpoints_delegate_to_adapter(monkeypatch):
     class FakeAdapter:
         def __init__(self):

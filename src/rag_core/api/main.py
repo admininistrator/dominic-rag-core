@@ -40,6 +40,10 @@ from rag_core.retrieval.evidence import (
 from rag_core.retrieval.query_processor import _expand_query
 from rag_core.retrieval.reranker import _rerank_results
 from rag_core.retrieval.scoring import _cosine_similarity, _hybrid_score, _lexical_overlap_score
+from rag_core.retrieval.contracts import RetrievalCandidate, RetrievalFilters, RetrievalPipeline, RetrievalQuery
+from rag_core.retrieval.fusion import ReciprocalRankFusionStrategy
+from rag_core.retrieval.reranking import ProviderReranker, RerankProviderResult
+from rag_core.retrieval.sparse import LexicalCorpusRetriever
 from rag_core.vector_store.qdrant_adapter import QdrantAdapter
 
 
@@ -124,23 +128,6 @@ def _require_internal_auth(authorization: str | None = Header(default=None)) -> 
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid bearer token.")
 
 
-def _extract_chunk_metadata_fields(chunk_meta: dict[str, Any]) -> dict[str, Any]:
-    fields: dict[str, Any] = {}
-    for key in (
-        "page_number",
-        "page_range",
-        "section_key",
-        "section_title",
-        "section_level",
-        "section_order",
-        "char_start",
-        "char_end",
-    ):
-        if key in chunk_meta:
-            fields[key] = chunk_meta.get(key)
-    return fields
-
-
 def _extract_stored_embedding(metadata_json: dict[str, Any]) -> list[float] | None:
     embedding = metadata_json.get("embedding")
     if isinstance(embedding, list) and embedding:
@@ -160,25 +147,116 @@ def _build_result_from_candidate(
     embedding_provider: str,
 ) -> dict[str, Any]:
     chunk_meta = dict(candidate.metadata_json or {})
+    normalized = RetrievalCandidate.from_mapping(
+        {
+            "document_id": candidate.document_id,
+            "chunk_id": candidate.chunk_id,
+            "chunk_index": candidate.chunk_index,
+            "title": candidate.title,
+            "source_type": candidate.source_type,
+            "source_uri": candidate.source_uri,
+            "score": score,
+            "semantic_score": semantic_score,
+            "lexical_score": lexical_score,
+            "token_count": candidate.token_count,
+            "token_estimate": _estimate_token_count(candidate.content, candidate.token_count),
+            "snippet": _build_snippet(candidate.content),
+            "content": candidate.content,
+            "vector_id": candidate.vector_id,
+            "embedding_model": candidate.embedding_model,
+            "embedding_provider": chunk_meta.get("embedding_provider", embedding_provider),
+            "metadata_json": chunk_meta,
+        },
+        source_stage=str(chunk_meta.get("source_stage") or "rank"),
+    ).to_result_dict()
+    normalized["metadata_json"] = chunk_meta
+    return normalized
+
+
+def _normalize_retrieval_mode(value: Any) -> str:
+    normalized = str(value or "hybrid_rerank").strip().lower().replace("-", "_")
+    if normalized in {"vector", "vector_only", "dense", "dense_only"}:
+        return "vector"
+    if normalized in {"hybrid", "hybrid_only"}:
+        return "hybrid"
+    return "hybrid_rerank"
+
+
+def _positive_int(value: Any, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = int(default)
+    return max(1, parsed)
+
+
+def _build_retrieval_config(request: RetrievalRankRequest) -> dict[str, Any]:
+    raw = dict(request.retrieval_config or {})
+    mode = _normalize_retrieval_mode(raw.get("retrieval_mode"))
+    enable_reranker = raw.get("enable_reranker") if "enable_reranker" in raw else None
+    resolved_enable_reranker = bool(enable_reranker) if enable_reranker is not None else mode == "hybrid_rerank"
     return {
-        "document_id": candidate.document_id,
-        "chunk_id": candidate.chunk_id,
-        "chunk_index": candidate.chunk_index,
-        "title": candidate.title,
-        "source_type": candidate.source_type,
-        "source_uri": candidate.source_uri,
-        "score": score,
-        "semantic_score": semantic_score,
-        "lexical_score": lexical_score,
-        "token_count": candidate.token_count,
-        "token_estimate": _estimate_token_count(candidate.content, candidate.token_count),
-        "snippet": _build_snippet(candidate.content),
-        "content": candidate.content,
-        "vector_id": candidate.vector_id,
-        "embedding_model": candidate.embedding_model,
-        "embedding_provider": chunk_meta.get("embedding_provider", embedding_provider),
-        **_extract_chunk_metadata_fields(chunk_meta),
+        "retrieval_mode": mode,
+        "enable_reranker": resolved_enable_reranker,
+        "dense_top_k": _positive_int(raw.get("dense_top_k"), request.top_k),
+        "sparse_top_k": _positive_int(raw.get("sparse_top_k"), request.top_k),
+        "fusion_top_k": _positive_int(raw.get("fusion_top_k"), request.top_k),
+        "rerank_top_k": _positive_int(raw.get("rerank_top_k"), request.top_k),
+        "reranker_provider": str(raw.get("reranker_provider") or "heuristic"),
+        "reranker_model": str(raw.get("reranker_model") or "rag-core-heuristic"),
+        "trace_id": raw.get("trace_id") or request.trace_id,
     }
+
+
+class _CandidateListRetriever:
+    def __init__(self, candidates: list[dict[str, Any]], *, source_stage: str) -> None:
+        self._candidates = list(candidates or [])
+        self._source_stage = source_stage
+
+    def retrieve(self, query: RetrievalQuery) -> list[RetrievalCandidate]:
+        return [
+            RetrievalCandidate.from_mapping(candidate, source_stage=self._source_stage)
+            for candidate in self._candidates
+        ]
+
+
+class _HeuristicRerankerProvider:
+    provider_name = "rag_core_heuristic"
+
+    def __init__(self, settings: RagCoreServiceSettings, *, model_name: str | None = None) -> None:
+        self.settings = settings
+        self.model_name = model_name or "rag-core-heuristic"
+
+    def rerank(self, query: RetrievalQuery, candidates: list[RetrievalCandidate]) -> list[RerankProviderResult]:
+        payloads = [candidate.to_result_dict() for candidate in candidates]
+        reranked = _rerank_results(
+            query.effective_text,
+            payloads,
+            max_rerank_candidates=self.settings.retrieval_max_rerank_candidates,
+            rerank_title_weight=self.settings.retrieval_rerank_title_weight,
+            rerank_position_weight=self.settings.retrieval_rerank_position_weight,
+        )
+        used: set[int] = set()
+        results: list[RerankProviderResult] = []
+        for item in reranked:
+            index = _find_candidate_index(item, candidates, used)
+            if index is None:
+                continue
+            used.add(index)
+            score = float(item.get("rerank_score") or item.get("score") or 0.0)
+            results.append(RerankProviderResult(candidate_index=index, score=score))
+        return results
+
+
+def _find_candidate_index(item: dict[str, Any], candidates: list[RetrievalCandidate], used: set[int]) -> int | None:
+    target = (item.get("document_id"), item.get("chunk_id"), item.get("vector_id"), item.get("content"))
+    for index, candidate in enumerate(candidates):
+        if index in used:
+            continue
+        identity = (candidate.document_id, candidate.chunk_id, candidate.vector_id, candidate.content)
+        if identity == target:
+            return index
+    return None
 
 
 @app.get("/")
@@ -382,6 +460,9 @@ def retrieval_rank(request: RetrievalRankRequest) -> RetrievalRankResponse:
     mixed_space_skip_count = 0
     chunk_embeddings_by_id: dict[int, list[float]] = {}
     missing_embedding_inputs: list[tuple[int, str]] = []
+    retrieval_config = _build_retrieval_config(request)
+    dense_payloads: list[dict[str, Any]] = []
+    corpus_payloads: list[dict[str, Any]] = []
 
     if not semantic_scores_by_chunk_id:
         for candidate in request.candidates:
@@ -424,33 +505,78 @@ def retrieval_rank(request: RetrievalRankRequest) -> RetrievalRankResponse:
             semantic_weight=settings.retrieval_hybrid_semantic_weight,
             lexical_weight=settings.retrieval_hybrid_lexical_weight,
         )
+        base_payload = _build_result_from_candidate(
+            candidate,
+            score=score,
+            semantic_score=semantic_score,
+            lexical_score=lexical_score,
+            embedding_provider=embed_meta.provider,
+        )
+        corpus_payloads.append(
+            {
+                **base_payload,
+                "score": 0.0,
+                "lexical_score": None,
+                "trace": {"retriever": "sparse_input"},
+            }
+        )
+        if semantic_score >= settings.retrieval_min_score:
+            dense_payloads.append(
+                {
+                    **base_payload,
+                    "score": semantic_score,
+                    "lexical_score": None,
+                    "trace": {"retriever": "dense"},
+                }
+            )
         if score < settings.retrieval_min_score and lexical_score < settings.retrieval_min_lexical_score:
             continue
-        scored_results.append(
-            _build_result_from_candidate(
-                candidate,
-                score=score,
-                semantic_score=semantic_score,
-                lexical_score=lexical_score,
-                embedding_provider=embed_meta.provider,
-            )
-        )
+        scored_results.append(base_payload)
 
-    scored_results.sort(key=lambda item: (-item["score"], item["document_id"], item["chunk_index"]))
-    deduped_results = _dedupe_scored_results(scored_results)
-    reranked_results = _rerank_results(
-        rewritten_query,
-        deduped_results,
-        max_rerank_candidates=settings.retrieval_max_rerank_candidates,
-        rerank_title_weight=settings.retrieval_rerank_title_weight,
-        rerank_position_weight=settings.retrieval_rerank_position_weight,
+    dense_payloads.sort(key=lambda item: (-float(item.get("score") or 0.0), item.get("document_id") or 0, item.get("chunk_index") or 0))
+    dense_payloads = dense_payloads[: int(retrieval_config["dense_top_k"])]
+    query = RetrievalQuery(
+        text=request.query,
+        top_k=request.top_k,
+        rewritten_text=rewritten_query,
+        query_expansions=tuple(query_expansions or []),
+        trace_id=retrieval_config.get("trace_id"),
+        filters=RetrievalFilters(),
+        config=dict(retrieval_config),
     )
-    results = reranked_results[: request.top_k]
+    pipeline = RetrievalPipeline(
+        stages=[
+            ("dense", _CandidateListRetriever(dense_payloads, source_stage="dense")),
+            (
+                "sparse",
+                LexicalCorpusRetriever(
+                    corpus_payloads,
+                    top_k=int(retrieval_config["sparse_top_k"]),
+                    min_score=settings.retrieval_min_lexical_score,
+                ),
+            ),
+        ],
+        fusion_strategy=ReciprocalRankFusionStrategy(top_k=int(retrieval_config["fusion_top_k"])),
+        reranker=ProviderReranker(
+            _HeuristicRerankerProvider(settings, model_name=retrieval_config.get("reranker_model")),
+            enabled=bool(retrieval_config.get("enable_reranker")),
+            top_k=int(retrieval_config["rerank_top_k"]),
+            provider_name=str(retrieval_config.get("reranker_provider") or "heuristic"),
+            model_name=str(retrieval_config.get("reranker_model") or "rag-core-heuristic"),
+        ),
+    )
+    package = pipeline.run(query)
+    retrieval_traces = [trace.to_dict() for trace in package.traces]
+    results = [candidate.to_result_dict() for candidate in package.candidates][: request.top_k]
+    reranked_count = next(
+        (int(trace.get("candidate_count") or 0) for trace in retrieval_traces if trace.get("stage") == "rerank"),
+        0,
+    )
     return RetrievalRankResponse(
         results=results,
         candidate_count=len(request.candidates),
-        matched_count=len(deduped_results),
-        reranked_count=len(reranked_results),
+        matched_count=len(package.candidates),
+        reranked_count=reranked_count,
         rewritten_query=rewritten_query,
         query_expansions=query_expansions,
         evidence_strength=_classify_evidence_strength(
@@ -460,6 +586,8 @@ def retrieval_rank(request: RetrievalRankRequest) -> RetrievalRankResponse:
         ),
         embedding_meta=embed_meta,
         mixed_space_skip_count=mixed_space_skip_count,
+        retrieval_config=retrieval_config,
+        retrieval_traces=retrieval_traces,
     )
 
 

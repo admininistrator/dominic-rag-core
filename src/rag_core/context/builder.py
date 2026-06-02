@@ -43,14 +43,17 @@ def _build_evidence_context(
     source_index = 1
 
     for row in knowledge_results:
-        blocks.append(
-            "\n".join(
-                [
-                    f"[Source {source_index}] type=knowledge title={row['title']} document_id={row['document_id']} chunk_id={row['chunk_id']} score={float(row.get('score') or 0):.3f}",
-                    row.get("content") or row.get("snippet") or "",
-                ]
+        if _is_table_result(row):
+            blocks.append(_build_table_evidence_block(row, source_index))
+        else:
+            blocks.append(
+                "\n".join(
+                    [
+                        f"[Source {source_index}] type=knowledge title={row['title']} document_id={row['document_id']} chunk_id={row['chunk_id']} score={float(row.get('score') or 0):.3f}",
+                        row.get("content") or row.get("snippet") or "",
+                    ]
+                )
             )
-        )
         source_index += 1
 
     for row in web_results or []:
@@ -96,9 +99,10 @@ def _pack_retrieval_results(
     packed_token_estimate = 0
 
     for row in results:
+        token_source = _context_token_source(row)
         token_estimate = int(
             row.get("token_estimate")
-            or max(1, len((row.get("content") or "")) // 4)
+            or max(1, len(token_source) // 4)
         )
         if len(packed_results) >= max_context_chunks:
             break
@@ -113,3 +117,50 @@ def _pack_retrieval_results(
         packed_token_estimate += token_estimate
 
     return packed_results, packed_token_estimate
+
+
+def _is_table_result(row: dict) -> bool:
+    return str(row.get("source_type") or "").lower() == "table" or bool(row.get("table_id"))
+
+
+def _build_table_evidence_block(row: dict, source_index: int) -> str:
+    metadata = dict(row.get("metadata_json") or row.get("metadata_extra") or {})
+    table_id = row.get("table_id") or metadata.get("table_id") or ""
+    page_number = row.get("page_number") or metadata.get("page_number")
+    section_key = row.get("section_key") or metadata.get("section_key") or ""
+    summary = row.get("text_summary") or metadata.get("text_summary") or row.get("snippet") or ""
+    markdown_table = row.get("markdown_table") or metadata.get("markdown_table") or ""
+    content = row.get("content") or ""
+    evidence_parts: list[str] = []
+    if summary:
+        evidence_parts.append(f"Table summary: {summary}")
+    if markdown_table:
+        evidence_parts.append(str(markdown_table))
+    elif content:
+        evidence_parts.append(str(content))
+    header_parts = [
+        f"[Source {source_index}] type=table",
+        f"title={row.get('title') or table_id or 'Table'}",
+        f"document_id={row.get('document_id')}",
+        f"chunk_id={row.get('chunk_id')}",
+        f"table_id={table_id}",
+    ]
+    if page_number is not None:
+        header_parts.append(f"page_number={page_number}")
+    if section_key:
+        header_parts.append(f"section_key={section_key}")
+    header_parts.append(f"score={float(row.get('score') or 0):.3f}")
+    return "\n".join([" ".join(header_parts), *evidence_parts])
+
+
+def _context_token_source(row: dict) -> str:
+    metadata = dict(row.get("metadata_json") or row.get("metadata_extra") or {})
+    return str(
+        row.get("content")
+        or row.get("markdown_table")
+        or metadata.get("markdown_table")
+        or row.get("text_summary")
+        or metadata.get("text_summary")
+        or row.get("snippet")
+        or ""
+    )
