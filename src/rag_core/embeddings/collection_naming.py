@@ -1,106 +1,157 @@
 """Collection name suggestion and validation utilities.
 
-These pure functions generate deterministic Qdrant collection names from
-provider + model combinations and validate existing collection config.
+RCSI-P3-T01/T05 naming convention::
 
-Collection naming convention::
+    rag_{tenant}_{provider}_{model}
 
-    knowledge_{provider}_{sanitized_model}
+The generated name is slug-safe, deterministic, and capped at Qdrant's 63
+character collection-name limit. If the conventional name would exceed the
+limit, it is truncated with an 8-character SHA-256 suffix so long names remain
+stable and low-collision.
 
-Examples:
-    - ``("api", "text-embedding-3-small")`` → ``"knowledge_api_text_embedding_3_small"``
-    - ``("ollama", "qwen3-embedding:0.6b")`` → ``"knowledge_ollama_qwen3_embedding_0_6b"``
-    - ``("local", "local-hash-v1")`` → ``"knowledge_local_local_hash_v1"``
+Backward compatibility is intentionally preserved for the legacy DominicBE
+collection names:
 
-Extracted from DominicBE's ``app/services/embeddings/collection_naming.py`` — exact copy.
-No import path changes needed (no rag_core imports in this file).
+* ``knowledge_chunks``
+* ``knowledge_{provider}_{model}``
 
-No dependency on CRUD, endpoints, vector_store, chat, or LlamaIndex.
+Those names are accepted by validation as legacy names, but new suggestions use
+the rag-core-owned ``rag_*`` convention.
 """
 from __future__ import annotations
 
+import hashlib
 import re
 
-# Qdrant maximum collection name length
-_QDRANT_MAX_COLLECTION_LENGTH = 63
+# Qdrant maximum collection name length used by the Phase 2 data model.
+QDRANT_MAX_COLLECTION_LENGTH = 63
 
-# Known legacy collection names
-_LEGACY_COLLECTION = "knowledge_chunks"
+# Known legacy collection names.
+LEGACY_DEFAULT_COLLECTION = "knowledge_chunks"
+LEGACY_PREFIX = "knowledge_"
+
+_SAFE_CHARS_RE = re.compile(r"[^a-z0-9]+")
+_UNDERSCORE_RE = re.compile(r"_+")
+
+
+def _slug(value: str, *, fallback: str) -> str:
+    """Return a lower-case Qdrant-safe slug.
+
+    The project convention intentionally uses underscores only. Qdrant supports
+    broader names, but keeping one safe character set avoids tenant/provider/model
+    punctuation leaking into collection identifiers.
+    """
+    raw = str(value or "").strip().lower()
+    sanitized = _SAFE_CHARS_RE.sub("_", raw)
+    sanitized = _UNDERSCORE_RE.sub("_", sanitized).strip("_")
+    return sanitized or fallback
 
 
 def _sanitize_model_name(model: str) -> str:
     """Sanitize a model name for use in a collection name.
 
-    Rules:
-    1. Lowercase.
-    2. Replace ``/``, ``:``, ``.``, ``-`` with ``_``.
-    3. Strip leading and trailing underscores.
-    4. Collapse multiple consecutive underscores into one.
-    5. Truncate to at most 63 characters minus the prefix overhead.
-
-    Args:
-        model: Raw model name (e.g. ``"text-embedding-3-small"``).
-
-    Returns:
-        Sanitized model name safe for Qdrant collection names.
+    Kept for backward compatibility with older imports/tests; new code should use
+    ``suggest_collection_name()`` so tenant/provider/model are handled together.
     """
-    sanitized = model.lower()
-    sanitized = re.sub(r"[/:.\-]", "_", sanitized)
-    sanitized = sanitized.strip("_")
-    sanitized = re.sub(r"_+", "_", sanitized)
-    return sanitized
+    return _slug(model, fallback="model")
 
 
-def suggest_collection_name(provider: str, model: str) -> str:
-    """Generate a deterministic Qdrant collection name from provider + model.
+def _legacy_provider_model_name(provider: str, model: str) -> str:
+    provider_slug = _slug(provider, fallback="provider")
+    model_slug = _slug(model, fallback="model")
+    raw = f"{LEGACY_PREFIX}{provider_slug}_{model_slug}"
+    return _truncate_with_hash(raw)
+
+
+def _truncate_with_hash(raw_name: str) -> str:
+    if len(raw_name) <= QDRANT_MAX_COLLECTION_LENGTH:
+        return raw_name
+    digest = hashlib.sha256(raw_name.encode("utf-8")).hexdigest()[:8]
+    suffix = f"_{digest}"
+    prefix_len = QDRANT_MAX_COLLECTION_LENGTH - len(suffix)
+    return f"{raw_name[:prefix_len].rstrip('_')}{suffix}"
+
+
+def suggest_collection_name(
+    provider: str,
+    model: str,
+    tenant_id: str = "default",
+    *,
+    legacy: bool = False,
+) -> str:
+    """Generate a deterministic Qdrant collection name.
 
     Args:
-        provider: Provider identifier (e.g. ``"local"``, ``"ollama"``, ``"api"``).
-        model: Model name (e.g. ``"local-hash-v1"``, ``"text-embedding-3-small"``).
+        provider: Provider identifier, e.g. ``local``, ``ollama``, ``api``.
+        model: Model name, e.g. ``local-hash-v1`` or ``text-embedding-3-small``.
+        tenant_id: Tenant/workspace scope. Defaults to ``default`` for local/dev
+            and for legacy two-argument callers.
+        legacy: When true, generate the historical ``knowledge_*`` provider/model
+            name. This is for compatibility checks only; new collections should
+            leave this false.
 
     Returns:
-        A sanitized collection name suitable for Qdrant, e.g.
-        ``"knowledge_api_text_embedding_3_small"``.
+        A slug-safe name <= 63 chars. New names follow
+        ``rag_{tenant}_{provider}_{model}``.
     """
-    prefix = f"knowledge_{provider}_"
-    sanitized = _sanitize_model_name(model)
-    max_model_len = _QDRANT_MAX_COLLECTION_LENGTH - len(prefix)
-    if max_model_len < 1:
-        # If the prefix alone exceeds the limit, truncate the prefix too
-        return f"knowledge_{provider[:16]}_{sanitized[:_QDRANT_MAX_COLLECTION_LENGTH - 32]}"
-    truncated = sanitized[:max_model_len].rstrip("_")
-    return f"{prefix}{truncated}"
+    if legacy:
+        return _legacy_provider_model_name(provider, model)
+
+    tenant_slug = _slug(tenant_id, fallback="default")
+    provider_slug = _slug(provider, fallback="provider")
+    model_slug = _slug(model, fallback="model")
+    raw = f"rag_{tenant_slug}_{provider_slug}_{model_slug}"
+    return _truncate_with_hash(raw)
 
 
-def validate_collection_config(provider: str, model: str, collection: str) -> list[str]:
-    """Validate that a collection name matches the expected naming convention.
+def is_legacy_collection_name(collection: str) -> bool:
+    """Return true when *collection* is a known/historical DominicBE name."""
+    value = str(collection or "").strip()
+    return value == LEGACY_DEFAULT_COLLECTION or value.startswith(LEGACY_PREFIX)
 
-    Returns a list of warning strings (empty if everything looks correct).
 
-    Args:
-        provider: Provider identifier.
-        model: Model name.
-        collection: Current collection name (e.g. from ``VECTOR_STORE_COLLECTION``).
+def validate_collection_config(
+    provider: str,
+    model: str,
+    collection: str,
+    tenant_id: str = "default",
+) -> list[str]:
+    """Validate that a collection name matches the rag-core convention.
 
-    Returns:
-        List of human-readable warning messages. Empty list means no warnings.
+    Returns warning strings rather than raising so callers can preserve old
+    deployments while nudging them to the new ``rag_*`` convention.
     """
     warnings: list[str] = []
+    expected = suggest_collection_name(provider, model, tenant_id=tenant_id)
+    legacy_expected = suggest_collection_name(provider, model, tenant_id=tenant_id, legacy=True)
 
-    if collection == _LEGACY_COLLECTION and provider != "local":
+    if collection == expected:
+        return warnings
+
+    if collection == LEGACY_DEFAULT_COLLECTION:
+        if provider != "local":
+            warnings.append(
+                f"Collection {collection!r} is the legacy default collection and may cause "
+                f"dimension conflicts for provider={provider!r}. Use rag-core collection "
+                f"{expected!r} instead."
+            )
+        else:
+            warnings.append(
+                f"Collection {collection!r} is a legacy collection name. New rag-core "
+                f"collections should use {expected!r}."
+            )
+        return warnings
+
+    if collection == legacy_expected or is_legacy_collection_name(collection):
         warnings.append(
-            f"Collection {collection!r} is the legacy collection typically used with "
-            f"the 'local' provider. Current provider is {provider!r}. "
-            f"This may cause dimension conflicts. "
-            f"Consider using: {suggest_collection_name(provider, model)!r}."
+            f"Collection {collection!r} uses a legacy knowledge_* naming convention. "
+            f"New rag-core collections should use {expected!r}."
         )
+        return warnings
 
-    expected = suggest_collection_name(provider, model)
-    if collection != expected and collection != _LEGACY_COLLECTION:
-        warnings.append(
-            f"Collection {collection!r} does not match the expected naming convention "
-            f"for provider={provider!r} model={model!r}. "
-            f"Expected: {expected!r}."
-        )
-
+    warnings.append(
+        f"Collection {collection!r} does not match the rag-core naming convention "
+        f"for tenant={tenant_id!r} provider={provider!r} model={model!r}. "
+        f"Expected: {expected!r}."
+    )
     return warnings

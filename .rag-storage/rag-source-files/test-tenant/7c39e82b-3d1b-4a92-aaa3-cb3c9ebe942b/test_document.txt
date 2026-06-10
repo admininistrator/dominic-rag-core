@@ -1,0 +1,1 @@
+This is a test document to verify the Phase 5 async RAG ingestion pipeline.

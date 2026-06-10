@@ -15,6 +15,64 @@ class EmbeddingMetaPayload(BaseModel):
     extra: dict[str, Any] = Field(default_factory=dict)
 
 
+class CollectionCreateRequest(BaseModel):
+    tenant_id: str = Field(default="default", min_length=1, max_length=128)
+    embedding_provider: str = Field(min_length=1, max_length=64)
+    embedding_model: str = Field(min_length=1, max_length=128)
+    embedding_dimensions: int = Field(gt=0)
+    name: str | None = Field(default=None, max_length=63)
+    display_name: str | None = Field(default=None, max_length=255)
+    metadata_json: dict[str, Any] = Field(default_factory=dict)
+
+
+class CollectionResponse(BaseModel):
+    id: str
+    name: str
+    display_name: str | None = None
+    tenant_id: str
+    embedding_provider: str
+    embedding_model: str
+    embedding_dimensions: int
+    status: str
+    document_count: int = 0
+    vector_count: int = 0
+    metadata_json: dict[str, Any] = Field(default_factory=dict)
+    created_at: str | None = None
+    updated_at: str | None = None
+
+
+class CollectionListResponse(BaseModel):
+    collections: list[CollectionResponse]
+    count: int
+
+
+class CollectionDeleteResponse(BaseModel):
+    ok: bool
+    deleted: bool
+    collection: CollectionResponse
+
+
+class StorageObjectPayload(BaseModel):
+    provider: str
+    bucket: str
+    key: str
+    uri: str
+    content_type: str | None = None
+    size_bytes: int
+    checksum: str | None = None
+
+
+class DocumentIntakeResponse(BaseModel):
+    document_id: str
+    job_id: str
+    status: str
+    collection_id: str
+    collection_name: str
+    source_uri: str
+    storage: StorageObjectPayload
+    metadata_json: dict[str, Any] = Field(default_factory=dict)
+
+
 class IndexingPrepareRequest(BaseModel):
     document_id: int = Field(ge=1)
     checksum: str = Field(min_length=1)
@@ -148,4 +206,82 @@ class ContextPackRequest(BaseModel):
 class ContextPackResponse(BaseModel):
     packed_results: list[dict[str, Any]]
     packed_token_estimate: int
+
+
+# ── Phase 7: Lifecycle / Query / Job schemas ──────────────────────────────
+
+
+class DocumentGetResponse(BaseModel):
+    document_id: str
+    tenant_id: str
+    collection_id: str
+    collection_name: str
+    external_id: str | None = None
+    title: str | None = None
+    source_type: str
+    source_uri: str | None = None
+    mime_type: str | None = None
+    checksum: str | None = None
+    file_size_bytes: int | None = None
+    status: str
+    chunk_count: int = 0
+    owner_username: str | None = None
+    metadata_json: dict[str, Any] = Field(default_factory=dict)
+    created_at: str | None = None
+    updated_at: str | None = None
+    deleted_at: str | None = None
+
+
+class DocumentDeleteResponse(BaseModel):
+    ok: bool
+    deleted: bool
+    document_id: str
+    status: str
+
+
+class JobStatusResponse(BaseModel):
+    job_id: str
+    document_id: str
+    status: str
+    step_current: str | None = None
+    step_progress: float | None = None
+    chunks_total: int | None = None
+    chunks_processed: int = 0
+    error_code: str | None = None
+    error_message: str | None = None
+    retry_count: int = 0
+    max_retries: int = 3
+    started_at: str | None = None
+    completed_at: str | None = None
+    created_at: str | None = None
+    updated_at: str | None = None
+
+
+class QueryRequest(BaseModel):
+    query: str = Field(min_length=1)
+    tenant_id: str | None = None
+    owner_username: str | None = None
+    top_k: int = Field(default=5, ge=1, le=200)
+    collection_id: str | None = None
+    collection_name: str | None = None
+    filters: dict[str, Any] | None = None
+
+
+class QueryResultPayload(BaseModel):
+    document_id: str
+    chunk_id: str | None = None
+    chunk_index: int = 0
+    score: float
+    content: str
+    title: str | None = None
+    source_type: str | None = None
+    source_uri: str | None = None
+    metadata_json: dict[str, Any] = Field(default_factory=dict)
+
+
+class QueryResponse(BaseModel):
+    query: str
+    top_k: int
+    returned: int
+    results: list[QueryResultPayload]
 

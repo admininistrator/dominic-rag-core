@@ -1,0 +1,110 @@
+# rag-core Celery worker service — Phase 5 (RCSI-P5-T09)
+#
+# This override adds the rag-core-worker service alongside the DominicBE services.
+# The worker consumes ONLY rag.* queues and writes ONLY to rag_core DB / Qdrant.
+#
+# Redis isolation:
+#   - rag-core: broker DB 2, result DB 3 (this service)
+#   - DominicBE: broker DB 0, result DB 1
+#
+# Usage:
+#   docker compose \
+#     -f DominicBE/deploy/docker-compose.local-rag.yml \
+#     -f DominicBE/deploy/docker-compose.local-redis.yml \
+#     -f rag-core/deploy/docker-compose.rag-core-worker.yml \
+#     -p deploy up -d
+
+services:
+  rag-core:
+    environment:
+      # ── Database url (points to postgres container db rag_core) ──
+      RAG_CORE_DATABASE_URL: "postgresql+psycopg://dominic:${DB_PASSWORD:-dominic_dev_password}@postgres:5432/rag_core"
+      # ── Celery / Redis config ──
+      RAG_CORE_CELERY_ENABLED: "true"
+      RAG_CORE_CELERY_BROKER_URL: "redis://:${REDIS_PASSWORD:-redis_dev_password}@redis:6379/2"
+      RAG_CORE_CELERY_RESULT_BACKEND: "redis://:${REDIS_PASSWORD:-redis_dev_password}@redis:6379/3"
+      # ── MinIO config ──
+      RAG_CORE_OBJECT_STORAGE_PROVIDER: minio
+      RAG_CORE_OBJECT_STORAGE_BUCKET: rag-source-files
+      RAG_CORE_OBJECT_STORAGE_ENDPOINT: "http://minio:9000"
+      RAG_CORE_OBJECT_STORAGE_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      RAG_CORE_OBJECT_STORAGE_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+      RAG_CORE_OBJECT_STORAGE_SECURE: "false"
+      RAG_CORE_OBJECT_STORAGE_MAX_UPLOAD_BYTES: "26214400"
+      RAG_CORE_OBJECT_STORAGE_LOCAL_PATH: "/tmp/rag-storage"
+
+  rag-core-worker:
+    build:
+      context: ../../rag-core
+      dockerfile: Dockerfile
+    container_name: dominic-rag-core-worker
+    restart: unless-stopped
+    entrypoint: []
+    command:
+      - celery
+      - "-A"
+      - rag_core.worker.celery_app
+      - worker
+      - "--loglevel=info"
+      - "--concurrency=2"
+      - "-Q"
+      - "rag.ingestion,rag.embedding,rag.reindex,rag.cleanup,rag.eval"
+      - "--hostname=rag-worker@%h"
+    environment:
+      # ── Celery / Redis (DB 2 broker, DB 3 result — separate from DominicBE DB 0/1) ──
+      RAG_CORE_CELERY_ENABLED: "true"
+      RAG_CORE_CELERY_BROKER_URL: "redis://:${REDIS_PASSWORD:-redis_dev_password}@redis:6379/2"
+      RAG_CORE_CELERY_RESULT_BACKEND: "redis://:${REDIS_PASSWORD:-redis_dev_password}@redis:6379/3"
+      RAG_CORE_CELERY_APP_NAME: "rag_core"
+      RAG_CORE_CELERY_DEFAULT_QUEUE: "rag.ingestion"
+      RAG_CORE_CELERY_TASK_SERIALIZER: "json"
+      RAG_CORE_CELERY_RESULT_SERIALIZER: "json"
+      RAG_CORE_CELERY_WORKER_CONCURRENCY: "2"
+      RAG_CORE_CELERY_TASK_TIME_LIMIT: "3600"
+      RAG_CORE_CELERY_TASK_SOFT_TIME_LIMIT: "3300"
+      RAG_CORE_CELERY_MAX_TASKS_PER_CHILD: "100"
+      # ── Queue names ──────────────────────────────────────────────────────────
+      RAG_CORE_QUEUE_INGESTION: "rag.ingestion"
+      RAG_CORE_QUEUE_EMBEDDING: "rag.embedding"
+      RAG_CORE_QUEUE_REINDEX: "rag.reindex"
+      RAG_CORE_QUEUE_CLEANUP: "rag.cleanup"
+      RAG_CORE_QUEUE_EVAL: "rag.eval"
+      # ── rag-core database (separate from chatbot_db) ─────────────────────────
+      RAG_CORE_DATABASE_URL: "postgresql+psycopg://dominic:${DB_PASSWORD:-dominic_dev_password}@postgres:5432/rag_core"
+      # ── Rate limiting for embedding provider ─────────────────────────────────
+      RAG_EMBEDDING_RATE_LIMIT_RPM: "60"
+      RAG_EMBEDDING_RATE_LIMIT_TPM: "100000"
+      RAG_EMBEDDING_MAX_CONCURRENT_BATCHES: "4"
+      # ── Embedding configuration ──────────────────────────────────────────────
+      EMBEDDING_PROVIDER: local
+      EMBEDDING_MODEL: local-hash-v1
+      EMBEDDING_DIMENSIONS: "64"
+      EMBEDDING_BATCH_SIZE: "16"
+      # ── Vector store ─────────────────────────────────────────────────────────
+      VECTOR_STORE_PROVIDER: qdrant
+      VECTOR_STORE_URL: "http://qdrant:6333"
+      VECTOR_STORE_COLLECTION: rag_default_local_local_hash_v1
+      # ── Object storage (rag-core owned rag-source-files bucket) ──────────────
+      RAG_CORE_OBJECT_STORAGE_PROVIDER: minio
+      RAG_CORE_OBJECT_STORAGE_BUCKET: rag-source-files
+      RAG_CORE_OBJECT_STORAGE_ENDPOINT: "http://minio:9000"
+      RAG_CORE_OBJECT_STORAGE_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      RAG_CORE_OBJECT_STORAGE_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+      RAG_CORE_OBJECT_STORAGE_SECURE: "false"
+      RAG_CORE_OBJECT_STORAGE_MAX_UPLOAD_BYTES: "26214400"
+      # ── Ingestion/retry config ───────────────────────────────────────────────
+      RAG_INGESTION_MAX_RETRIES: "3"
+      RAG_INGESTION_RETRY_DELAY_SECONDS: "5"
+      CHUNK_SIZE: "800"
+      CHUNK_OVERLAP: "100"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+      minio:
+        condition: service_started
+      rag-core:
+        condition: service_healthy

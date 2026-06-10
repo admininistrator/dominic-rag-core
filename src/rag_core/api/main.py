@@ -2,20 +2,33 @@
 
 from __future__ import annotations
 
+import json
 from secrets import compare_digest
 from types import SimpleNamespace
 from typing import Any
 
-from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, UploadFile, status
 from fastapi.responses import JSONResponse
+from sqlalchemy.orm import Session
 
 from rag_core.api.config import RagCoreServiceSettings, get_service_settings
 from rag_core.api.schemas import (
+    CollectionCreateRequest,
+    CollectionDeleteResponse,
+    CollectionListResponse,
+    CollectionResponse,
     ContextPackRequest,
     ContextPackResponse,
+    DocumentDeleteResponse,
+    DocumentGetResponse,
+    DocumentIntakeResponse,
     EmbeddingMetaPayload,
     IndexingPrepareRequest,
     IndexingPrepareResponse,
+    JobStatusResponse,
+    QueryRequest,
+    QueryResponse,
+    QueryResultPayload,
     RetrievalCandidatePayload,
     RetrievalRankRequest,
     RetrievalRankResponse,
@@ -27,6 +40,7 @@ from rag_core.api.schemas import (
     VectorUpsertResponse,
 )
 from rag_core.context.builder import _pack_retrieval_results
+from rag_core.db.database import get_db
 from rag_core.embeddings.base import EmbeddingMeta
 from rag_core.embeddings.factory import get_embedding_provider
 from rag_core.indexing.pipeline import prepare_chunks_for_indexing
@@ -44,7 +58,25 @@ from rag_core.retrieval.contracts import RetrievalCandidate, RetrievalFilters, R
 from rag_core.retrieval.fusion import ReciprocalRankFusionStrategy
 from rag_core.retrieval.reranking import ProviderReranker, RerankProviderResult
 from rag_core.retrieval.sparse import LexicalCorpusRetriever
+from rag_core.services.collection_registry import (
+    CollectionDimensionMismatchError,
+    CollectionNotFoundError,
+    CollectionRegistrationInput,
+    CollectionRegistryError,
+    collection_health_summary,
+    delete_collection,
+    get_collection,
+    list_collections,
+    register_collection,
+)
+from rag_core.services.document_intake import (
+    DocumentIntakeError,
+    DocumentStorageError,
+    DocumentUploadInput,
+    create_document_from_upload,
+)
 from rag_core.vector_store.qdrant_adapter import QdrantAdapter
+from rag_core.worker.health import check_worker_health
 
 
 app = FastAPI(title="rag-core", version="0.1.0")
@@ -56,6 +88,127 @@ def _health_response(payload: dict[str, Any]) -> JSONResponse:
 
 def _sanitize_exception_type(exc: Exception) -> str:
     return type(exc).__name__
+
+
+def _collection_health_summary() -> dict[str, Any]:
+    """Best-effort collection registry health summary for /health and /ready."""
+    return collection_health_summary()
+
+
+def _collection_error(exc: CollectionRegistryError, *, status_code: int) -> HTTPException:
+    return HTTPException(
+        status_code=status_code,
+        detail={
+            "error": {
+                "code": getattr(exc, "error_code", "RAG_COLLECTION_ERROR"),
+                "message": str(exc),
+                "details": {},
+            }
+        },
+    )
+
+
+def _document_error(code: str, message: str, *, status_code: int, details: dict[str, Any] | None = None) -> HTTPException:
+    return HTTPException(
+        status_code=status_code,
+        detail={"error": {"code": code, "message": message, "details": details or {}}},
+    )
+
+
+def _parse_metadata_json(raw: str | None) -> dict[str, Any]:
+    if raw is None or not raw.strip():
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise _document_error(
+            "RAG_INVALID_REQUEST",
+            "metadata_json must be valid JSON object text.",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        ) from exc
+    if not isinstance(parsed, dict):
+        raise _document_error(
+            "RAG_INVALID_REQUEST",
+            "metadata_json must decode to an object.",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+    return dict(parsed)
+
+
+def _dt_to_iso(value: Any) -> str | None:
+    if value is None:
+        return None
+    isoformat = getattr(value, "isoformat", None)
+    return isoformat() if callable(isoformat) else str(value)
+
+
+def _collection_to_response(collection: Any) -> CollectionResponse:
+    return CollectionResponse(
+        id=str(collection.id),
+        name=str(collection.name),
+        display_name=collection.display_name,
+        tenant_id=str(collection.tenant_id),
+        embedding_provider=str(collection.embedding_provider),
+        embedding_model=str(collection.embedding_model),
+        embedding_dimensions=int(collection.embedding_dimensions),
+        status=str(collection.status),
+        document_count=int(collection.document_count or 0),
+        vector_count=int(collection.vector_count or 0),
+        metadata_json=dict(collection.metadata_json or {}),
+        created_at=_dt_to_iso(collection.created_at),
+        updated_at=_dt_to_iso(collection.updated_at),
+    )
+
+
+def _registration_input_from_request(request: CollectionCreateRequest) -> CollectionRegistrationInput:
+    return CollectionRegistrationInput(
+        tenant_id=request.tenant_id,
+        embedding_provider=request.embedding_provider,
+        embedding_model=request.embedding_model,
+        embedding_dimensions=request.embedding_dimensions,
+        name=request.name,
+        display_name=request.display_name,
+        metadata_json=dict(request.metadata_json or {}),
+    )
+
+
+def _embedding_dimensions_from_prepared_chunks(prepared_chunks: list[dict[str, Any]], fallback: int) -> int:
+    if not prepared_chunks:
+        return fallback
+    first = prepared_chunks[0] or {}
+    metadata = dict(first.get("metadata_json") or {})
+    raw_dimensions = metadata.get("embedding_dimensions")
+    if raw_dimensions:
+        try:
+            return int(raw_dimensions)
+        except (TypeError, ValueError):
+            pass
+    embedding = first.get("embedding")
+    if isinstance(embedding, list) and embedding:
+        return len(embedding)
+    return fallback
+
+
+def _register_collection_for_vector_upsert(
+    db: Session,
+    settings: RagCoreServiceSettings,
+    request: VectorUpsertRequest,
+) -> None:
+    first_meta = dict((request.prepared_chunks[0].get("metadata_json") if request.prepared_chunks else {}) or {})
+    provider = request.embedding_provider or str(first_meta.get("embedding_provider") or settings.embedding_provider)
+    model = request.embedding_model or str(first_meta.get("embedding_model") or settings.embedding_model)
+    dimensions = _embedding_dimensions_from_prepared_chunks(request.prepared_chunks, settings.embedding_dimensions)
+    register_collection(
+        db,
+        CollectionRegistrationInput(
+            tenant_id=str(first_meta.get("tenant_id") or "default"),
+            embedding_provider=provider,
+            embedding_model=model,
+            embedding_dimensions=dimensions,
+            name=settings.vector_store_collection,
+            metadata_json={"registered_from": "vector_upsert"},
+        ),
+    )
 
 
 def _meta_payload(meta: EmbeddingMeta | EmbeddingMetaPayload | dict[str, Any] | None) -> EmbeddingMetaPayload:
@@ -274,12 +427,16 @@ def health() -> JSONResponse:
         "model": settings.embedding_model,
         "dimensions": settings.embedding_dimensions,
     }
+    collections = _collection_health_summary()
+    worker = check_worker_health()
     payload = {
         "ok": bool(embedding.get("ok")) and (not settings.qdrant_enabled or bool(qdrant.get("ok"))),
         "service": settings.app_name,
         "dependencies": {
             "embedding": embedding,
             "qdrant": qdrant,
+            "collections": collections,
+            "worker": worker,
         },
         "api_key_configured": bool(settings.api_key),
     }
@@ -290,13 +447,172 @@ def health() -> JSONResponse:
 def ready() -> JSONResponse:
     settings = get_service_settings()
     qdrant = _get_vector_adapter(settings).check_health()
+    collections = _collection_health_summary()
+    worker = check_worker_health()
     payload = {
         "ok": bool(settings.api_key) and (not settings.qdrant_enabled or bool(qdrant.get("ok"))),
         "service": settings.app_name,
         "api_key_configured": bool(settings.api_key),
-        "dependencies": {"qdrant": qdrant},
+        "dependencies": {"qdrant": qdrant, "collections": collections, "worker": worker},
     }
     return _health_response(payload)
+
+
+@app.post(
+    "/rag/v1/collections",
+    response_model=CollectionResponse,
+    dependencies=[Depends(_require_internal_auth)],
+)
+def collection_create(
+    request: CollectionCreateRequest,
+    db: Session = Depends(get_db),
+) -> CollectionResponse:
+    try:
+        collection = register_collection(db, _registration_input_from_request(request))
+    except CollectionDimensionMismatchError as exc:
+        raise _collection_error(exc, status_code=status.HTTP_409_CONFLICT) from exc
+    except CollectionRegistryError as exc:
+        raise _collection_error(exc, status_code=status.HTTP_400_BAD_REQUEST) from exc
+    return _collection_to_response(collection)
+
+
+@app.get(
+    "/rag/v1/collections",
+    response_model=CollectionListResponse,
+    dependencies=[Depends(_require_internal_auth)],
+)
+def collection_list(
+    tenant_id: str | None = Query(default=None),
+    status_filter: str | None = Query(default=None, alias="status"),
+    db: Session = Depends(get_db),
+) -> CollectionListResponse:
+    collections = list_collections(db, tenant_id=tenant_id, status_filter=status_filter)
+    responses = [_collection_to_response(collection) for collection in collections]
+    return CollectionListResponse(collections=responses, count=len(responses))
+
+
+@app.get(
+    "/rag/v1/collections/{identifier}",
+    response_model=CollectionResponse,
+    dependencies=[Depends(_require_internal_auth)],
+)
+def collection_get(identifier: str, db: Session = Depends(get_db)) -> CollectionResponse:
+    try:
+        collection = get_collection(db, identifier)
+    except CollectionNotFoundError as exc:
+        raise _collection_error(exc, status_code=status.HTTP_404_NOT_FOUND) from exc
+    return _collection_to_response(collection)
+
+
+@app.delete(
+    "/rag/v1/collections/{identifier}",
+    response_model=CollectionDeleteResponse,
+    dependencies=[Depends(_require_internal_auth)],
+)
+def collection_delete(identifier: str, db: Session = Depends(get_db)) -> CollectionDeleteResponse:
+    try:
+        collection = delete_collection(db, identifier)
+    except CollectionNotFoundError as exc:
+        raise _collection_error(exc, status_code=status.HTTP_404_NOT_FOUND) from exc
+    return CollectionDeleteResponse(ok=True, deleted=True, collection=_collection_to_response(collection))
+
+
+@app.post(
+    "/rag/v1/documents",
+    response_model=DocumentIntakeResponse,
+    dependencies=[Depends(_require_internal_auth)],
+)
+async def document_create(
+    tenant_id: str = Form(default="default"),
+    external_id: str | None = Form(default=None),
+    title: str | None = Form(default=None),
+    collection_id: str | None = Form(default=None),
+    collection_name: str | None = Form(default=None),
+    owner_username: str | None = Form(default=None),
+    metadata_json: str | None = Form(default=None),
+    source_uri: str | None = Form(default=None),
+    file: UploadFile | None = File(default=None),
+    db: Session = Depends(get_db),
+) -> DocumentIntakeResponse:
+    if (source_uri or "").strip():
+        raise _document_error(
+            "RAG_URI_INTAKE_DISABLED",
+            "URI/reference intake is disabled by default; send multipart file bytes to rag-core.",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+    if file is None:
+        raise _document_error(
+            "RAG_INVALID_REQUEST",
+            "Multipart file field 'file' is required.",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+    metadata = _parse_metadata_json(metadata_json)
+    content = await file.read()
+    payload = DocumentUploadInput(
+        tenant_id=tenant_id,
+        external_id=external_id,
+        title=title,
+        collection_id=collection_id,
+        collection_name=collection_name,
+        owner_username=owner_username,
+        filename=file.filename or "upload.bin",
+        content=content,
+        content_type=file.content_type,
+        metadata_json=metadata,
+    )
+    try:
+        result = create_document_from_upload(db, payload)
+    except CollectionNotFoundError as exc:
+        raise _collection_error(exc, status_code=status.HTTP_404_NOT_FOUND) from exc
+    except CollectionRegistryError as exc:
+        raise _collection_error(exc, status_code=status.HTTP_400_BAD_REQUEST) from exc
+    except DocumentStorageError as exc:
+        raise _document_error(
+            getattr(exc, "error_code", "RAG_STORAGE_UNAVAILABLE"),
+            str(exc),
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        ) from exc
+    except DocumentIntakeError as exc:
+        raise _document_error(
+            getattr(exc, "error_code", "RAG_INVALID_REQUEST"),
+            str(exc),
+            status_code=status.HTTP_400_BAD_REQUEST,
+        ) from exc
+    storage_payload = dict(result.storage or {})
+    storage_payload.setdefault("uri", result.source_uri)
+
+    # ── Enqueue async ingestion when Celery is enabled (Phase 5) ─────────
+    enqueued = False
+    settings_for_enqueue = get_service_settings()
+    if settings_for_enqueue.celery_enabled:
+        try:
+            from rag_core.worker.celery_app import celery_app
+
+            celery_app.send_task(
+                "rag.ingest_document",
+                args=[result.document_id, result.job_id],
+                queue=settings_for_enqueue.queue_ingestion,
+            )
+            enqueued = True
+        except Exception:
+            # Graceful fallback — the queued job placeholder is already in
+            # the DB; the worker will pick it up when it polls or a later
+            # explicit enqueue happens.
+            pass
+
+    return DocumentIntakeResponse(
+        document_id=result.document_id,
+        job_id=result.job_id,
+        status=result.status if not enqueued else "queued",
+        collection_id=result.collection_id,
+        collection_name=result.collection_name,
+        source_uri=result.source_uri,
+        storage=storage_payload,
+        metadata_json=result.metadata_json if not enqueued else {
+            **result.metadata_json,
+            "_celery_enqueued": enqueued,
+        },
+    )
 
 
 @app.post("/v1/indexing/prepare", response_model=IndexingPrepareResponse, dependencies=[Depends(_require_internal_auth)])
@@ -342,10 +658,16 @@ def indexing_prepare(request: IndexingPrepareRequest) -> IndexingPrepareResponse
 
 
 @app.post("/v1/vector/upsert", response_model=VectorUpsertResponse, dependencies=[Depends(_require_internal_auth)])
-def vector_upsert(request: VectorUpsertRequest) -> VectorUpsertResponse:
+def vector_upsert(request: VectorUpsertRequest, db: Session = Depends(get_db)) -> VectorUpsertResponse:
     settings = get_service_settings()
     if not settings.qdrant_enabled:
         return VectorUpsertResponse(ok=True, upserted=False)
+    try:
+        _register_collection_for_vector_upsert(db, settings, request)
+    except CollectionDimensionMismatchError as exc:
+        raise _collection_error(exc, status_code=status.HTTP_409_CONFLICT) from exc
+    except CollectionRegistryError as exc:
+        raise _collection_error(exc, status_code=status.HTTP_400_BAD_REQUEST) from exc
     adapter = _get_vector_adapter(settings)
     rows = [SimpleNamespace(id=row.id, chunk_index=row.chunk_index) for row in request.chunk_rows]
     first_meta = dict((request.prepared_chunks[0].get("metadata_json") if request.prepared_chunks else {}) or {})
@@ -600,4 +922,277 @@ def context_pack(request: ContextPackRequest) -> ContextPackResponse:
         max_context_tokens=request.max_context_tokens or settings.retrieval_max_context_tokens,
     )
     return ContextPackResponse(packed_results=packed, packed_token_estimate=token_estimate)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Phase 7: Document lifecycle / Job status / Query endpoints
+# ════════════════════════════════════════════════════════════════════════════
+
+
+@app.get(
+    "/rag/v1/documents/{document_id}",
+    response_model=DocumentGetResponse,
+    dependencies=[Depends(_require_internal_auth)],
+)
+def document_get(document_id: str, db: Session = Depends(get_db)) -> DocumentGetResponse:
+    """Return rag-core-owned document metadata."""
+    from rag_core.db.models.documents import RagDocument
+    from rag_core.db.models.collections import RagCollection
+
+    import uuid as _uuid_mod
+
+    try:
+        doc_uuid = _uuid_mod.UUID(document_id)
+    except ValueError:
+        raise _document_error(
+            "RAG_DOCUMENT_NOT_FOUND",
+            "Document not found.",
+            status_code=status.HTTP_404_NOT_FOUND,
+        )
+
+    doc = db.query(RagDocument).filter(RagDocument.id == doc_uuid).first()
+    if doc is None:
+        raise _document_error(
+            "RAG_DOCUMENT_NOT_FOUND",
+            "Document not found.",
+            status_code=status.HTTP_404_NOT_FOUND,
+        )
+
+    collection = db.query(RagCollection).filter(RagCollection.id == doc.collection_id).first()
+    collection_name = str(collection.name) if collection else "unknown"
+
+    return DocumentGetResponse(
+        document_id=str(doc.id),
+        tenant_id=str(doc.tenant_id),
+        collection_id=str(doc.collection_id),
+        collection_name=collection_name,
+        external_id=doc.external_id,
+        title=doc.title,
+        source_type=str(doc.source_type),
+        source_uri=doc.source_uri,
+        mime_type=doc.mime_type,
+        checksum=doc.checksum,
+        file_size_bytes=doc.file_size_bytes,
+        status=str(doc.status),
+        chunk_count=int(doc.chunk_count or 0),
+        owner_username=doc.owner_username,
+        metadata_json=dict(doc.metadata_json or {}),
+        created_at=_dt_to_iso(doc.created_at),
+        updated_at=_dt_to_iso(doc.updated_at),
+        deleted_at=_dt_to_iso(doc.deleted_at),
+    )
+
+
+@app.delete(
+    "/rag/v1/documents/{document_id}",
+    response_model=DocumentDeleteResponse,
+    dependencies=[Depends(_require_internal_auth)],
+)
+def document_delete(document_id: str, db: Session = Depends(get_db)) -> DocumentDeleteResponse:
+    """Soft-delete a rag-core document and schedule vector/index cleanup."""
+    from rag_core.db.models.documents import RagDocument
+    from rag_core.db.models.ingestion_jobs import RagIngestionJob
+    from rag_core.db.models.chunks import RagChunk
+    from datetime import datetime as _dt, timezone as _tz
+
+    import uuid as _uuid_mod
+
+    try:
+        doc_uuid = _uuid_mod.UUID(document_id)
+    except ValueError:
+        raise _document_error(
+            "RAG_DOCUMENT_NOT_FOUND",
+            "Document not found.",
+            status_code=status.HTTP_404_NOT_FOUND,
+        )
+
+    doc = db.query(RagDocument).filter(RagDocument.id == doc_uuid).first()
+    if doc is None:
+        raise _document_error(
+            "RAG_DOCUMENT_NOT_FOUND",
+            "Document not found.",
+            status_code=status.HTTP_404_NOT_FOUND,
+        )
+
+    if doc.status == "deleted":
+        return DocumentDeleteResponse(ok=True, deleted=False, document_id=str(doc.id), status="deleted")
+
+    doc.status = "deleted"
+    doc.deleted_at = _dt.now(_tz.utc)
+    doc.metadata_json = {
+        **dict(doc.metadata_json or {}),
+        "_deleted_from": "rag-core-api-v1-delete-endpoint",
+    }
+
+    # Cancel any active ingestion jobs
+    active_jobs = (
+        db.query(RagIngestionJob)
+        .filter(
+            RagIngestionJob.document_id == doc_uuid,
+            RagIngestionJob.status.in_(["queued", "processing", "embedding", "indexing"]),
+        )
+        .all()
+    )
+    for job in active_jobs:
+        job.status = "cancelled"
+        job.error_message = "Document deleted by API."
+
+    chunks = db.query(RagChunk).filter(RagChunk.document_id == doc_uuid).all()
+    for chunk in chunks:
+        chunk.metadata_json = {
+            **dict(chunk.metadata_json or {}),
+            "_status": "deleted",
+        }
+
+    # Enqueue vector cleanup when Celery is enabled
+    settings_for_delete = get_service_settings()
+    if settings_for_delete.celery_enabled:
+        try:
+            from rag_core.worker.celery_app import celery_app
+
+            celery_app.send_task(
+                "rag.delete_document_vectors",
+                args=[str(doc_uuid)],
+                queue=settings_for_delete.queue_cleanup,
+            )
+        except Exception:
+            pass
+
+    db.commit()
+    return DocumentDeleteResponse(ok=True, deleted=True, document_id=str(doc.id), status="deleted")
+
+
+@app.get(
+    "/rag/v1/jobs/{job_id}",
+    response_model=JobStatusResponse,
+    dependencies=[Depends(_require_internal_auth)],
+)
+def job_get(job_id: str, db: Session = Depends(get_db)) -> JobStatusResponse:
+    """Return async ingestion job status."""
+    from rag_core.db.models.ingestion_jobs import RagIngestionJob
+
+    import uuid as _uuid_mod
+
+    try:
+        job_uuid = _uuid_mod.UUID(job_id)
+    except ValueError:
+        raise _document_error(
+            "RAG_INVALID_REQUEST",
+            "Invalid job ID format.",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+    job = db.query(RagIngestionJob).filter(RagIngestionJob.id == job_uuid).first()
+    if job is None:
+        raise _document_error(
+            "RAG_JOB_NOT_FOUND",
+            "Job not found.",
+            status_code=status.HTTP_404_NOT_FOUND,
+        )
+
+    return JobStatusResponse(
+        job_id=str(job.id),
+        document_id=str(job.document_id),
+        status=str(job.status),
+        step_current=job.step_current,
+        step_progress=job.step_progress,
+        chunks_total=job.chunks_total,
+        chunks_processed=int(job.chunks_processed or 0),
+        error_code=job.error_code,
+        error_message=job.error_message,
+        retry_count=int(job.retry_count or 0),
+        max_retries=int(job.max_retries or 3),
+        started_at=_dt_to_iso(job.started_at),
+        completed_at=_dt_to_iso(job.completed_at),
+        created_at=_dt_to_iso(job.created_at),
+        updated_at=_dt_to_iso(job.updated_at),
+    )
+
+
+@app.post(
+    "/rag/v1/query",
+    response_model=QueryResponse,
+    dependencies=[Depends(_require_internal_auth)],
+)
+def query_rag(request: QueryRequest, db: Session = Depends(get_db)) -> QueryResponse:
+    """Semantic search across rag-core-owned collections."""
+    from rag_core.db.models.collections import RagCollection
+    from rag_core.db.models.documents import RagDocument
+
+    settings_q = get_service_settings()
+    if not settings_q.qdrant_enabled:
+        return QueryResponse(query=request.query, top_k=request.top_k, returned=0, results=[])
+
+    # Resolve collection
+    collection = None
+    identifier = (request.collection_id or request.collection_name or "").strip()
+    try:
+        from rag_core.services.collection_registry import get_collection
+
+        if identifier:
+            collection = get_collection(db, identifier)
+        else:
+            collection = get_collection(db, settings_q.vector_store_collection)
+    except Exception:
+        collection = None
+
+    if collection is None:
+        return QueryResponse(query=request.query, top_k=request.top_k, returned=0, results=[])
+
+    # Get embedding for query
+    provider = _get_embedding_provider(settings_q)
+    embedded = provider.embed_query(request.query)
+    query_vector = embedded.vector
+
+    # Search Qdrant
+    adapter = _get_vector_adapter(settings_q)
+    try:
+        hits = adapter.search_similar_chunks(
+            request.owner_username or "default",
+            query_vector,
+            top_k=request.top_k,
+        )
+    except Exception:
+        return QueryResponse(query=request.query, top_k=request.top_k, returned=0, results=[])
+
+    # Enrich results with document info from rag_core DB
+    results: list[QueryResultPayload] = []
+    for hit in hits:
+        chunk_id_int = int(hit.get("chunk_id", 0)) if isinstance(hit.get("chunk_id"), (int, float)) else None
+        document_id_raw = hit.get("document_id")
+
+        doc_title = None
+        doc_source_type = None
+        doc_source_uri = None
+        doc_id_str = str(document_id_raw or "")
+
+        # Try to look up rag-core document by the external_id (DominicBE doc ID in Phase 6)
+        if document_id_raw is not None:
+            doc = db.query(RagDocument).filter(RagDocument.external_id == str(document_id_raw)).first()
+            if doc:
+                doc_id_str = str(doc.id)
+                doc_title = doc.title
+                doc_source_type = str(doc.source_type)
+                doc_source_uri = doc.source_uri
+
+        results.append(
+            QueryResultPayload(
+                document_id=doc_id_str,
+                chunk_id=str(chunk_id_int) if chunk_id_int is not None else None,
+                chunk_index=int(hit.get("chunk_index", 0)),
+                score=float(hit.get("score", 0.0)),
+                content=str(hit.get("content") or ""),
+                title=doc_title,
+                source_type=doc_source_type,
+                source_uri=doc_source_uri,
+                metadata_json=dict(hit.get("metadata_json") or {}),
+            )
+        )
+
+    return QueryResponse(
+        query=request.query,
+        top_k=request.top_k,
+        returned=len(results),
+        results=results,
+    )
 

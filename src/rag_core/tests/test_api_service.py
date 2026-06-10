@@ -251,46 +251,55 @@ def test_vector_endpoints_delegate_to_adapter(monkeypatch):
     monkeypatch.setenv("VECTOR_STORE_URL", "http://qdrant:6333")
     get_service_settings.cache_clear()
     monkeypatch.setattr(api_main, "_get_vector_adapter", lambda settings: fake)
+    monkeypatch.setattr(api_main, "register_collection", lambda db, payload: None)
+
+    def fake_get_db():
+        yield object()
+
+    api_main.app.dependency_overrides[api_main.get_db] = fake_get_db
     client = TestClient(api_main.app)
 
-    delete_response = client.post(
-        "/v1/vector/delete",
-        headers=_headers(),
-        json={"owner_username": "alice", "document_id": 9},
-    )
-    assert delete_response.status_code == 200
-    assert fake.deleted == ("alice", 9)
+    try:
+        delete_response = client.post(
+            "/v1/vector/delete",
+            headers=_headers(),
+            json={"owner_username": "alice", "document_id": 9},
+        )
+        assert delete_response.status_code == 200
+        assert fake.deleted == ("alice", 9)
 
-    upsert_response = client.post(
-        "/v1/vector/upsert",
-        headers=_headers(),
-        json={
-            "document": {
-                "owner_username": "alice",
-                "document_id": 9,
-                "title": "Doc",
-                "source_type": "text",
-                "source_uri": None,
-                "session_id": None,
+        upsert_response = client.post(
+            "/v1/vector/upsert",
+            headers=_headers(),
+            json={
+                "document": {
+                    "owner_username": "alice",
+                    "document_id": 9,
+                    "title": "Doc",
+                    "source_type": "text",
+                    "source_uri": None,
+                    "session_id": None,
+                },
+                "chunk_rows": [{"id": 5, "chunk_index": 0}],
+                "prepared_chunks": [
+                    {
+                        "chunk_index": 0,
+                        "embedding": [0.1, 0.2],
+                        "metadata_json": {"embedding_provider": "local", "embedding_model": "local-hash-v1"},
+                    }
+                ],
             },
-            "chunk_rows": [{"id": 5, "chunk_index": 0}],
-            "prepared_chunks": [
-                {
-                    "chunk_index": 0,
-                    "embedding": [0.1, 0.2],
-                    "metadata_json": {"embedding_provider": "local", "embedding_model": "local-hash-v1"},
-                }
-            ],
-        },
-    )
-    assert upsert_response.status_code == 200
-    assert fake.upserted["document_id"] == 9
+        )
+        assert upsert_response.status_code == 200
+        assert fake.upserted["document_id"] == 9
 
-    search_response = client.post(
-        "/v1/vector/search",
-        headers=_headers(),
-        json={"owner_username": "alice", "top_k": 1, "query_vector": [0.1, 0.2]},
-    )
-    assert search_response.status_code == 200
-    assert search_response.json()["vector_hits"][0]["chunk_id"] == 5
+        search_response = client.post(
+            "/v1/vector/search",
+            headers=_headers(),
+            json={"owner_username": "alice", "top_k": 1, "query_vector": [0.1, 0.2]},
+        )
+        assert search_response.status_code == 200
+        assert search_response.json()["vector_hits"][0]["chunk_id"] == 5
+    finally:
+        api_main.app.dependency_overrides.clear()
 
