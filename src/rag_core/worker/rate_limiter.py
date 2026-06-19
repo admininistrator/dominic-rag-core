@@ -134,13 +134,17 @@ class EmbeddingRateLimiter:
 
         now = time.time()
         window_key = f"{_REDIS_KEY_PREFIX}:window:{int(now // 60)}"
-        pipe = self._redis.pipeline()
-        pipe.incr(f"{window_key}:rpm")
-        pipe.expire(f"{window_key}:rpm", 120)
-        if token_estimate > 0:
-            pipe.incrby(f"{window_key}:tpm", token_estimate)
-            pipe.expire(f"{window_key}:tpm", 120)
-        results: list[Any] = pipe.execute()
+        try:
+            pipe = self._redis.pipeline()
+            pipe.incr(f"{window_key}:rpm")
+            pipe.expire(f"{window_key}:rpm", 120)
+            if token_estimate > 0:
+                pipe.incrby(f"{window_key}:tpm", token_estimate)
+                pipe.expire(f"{window_key}:tpm", 120)
+            results: list[Any] = pipe.execute()
+        except redis.exceptions.ConnectionError:
+            logger.warning("Redis unreachable for rate limiting; proceeding without rate limiting.")
+            return None
 
         rpm_count = int(results[0] or 0)
         if rpm_count > self._config.rpm:

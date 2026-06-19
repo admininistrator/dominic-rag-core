@@ -173,7 +173,7 @@ class QdrantAdapter:
             chunk_meta = meta_by_index.get(int(row.chunk_index), {})
             points.append(
                 models.PointStruct(
-                    id=int(row.id),
+                    id=str(row.id),
                     vector=vector,
                     payload={
                         "owner_username": owner_username,

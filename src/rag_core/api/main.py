@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from secrets import compare_digest
 from types import SimpleNamespace
 from typing import Any
@@ -75,11 +76,14 @@ from rag_core.services.document_intake import (
     DocumentUploadInput,
     create_document_from_upload,
 )
+from rag_core.services.ingestion_service import process_document_ingestion
 from rag_core.vector_store.qdrant_adapter import QdrantAdapter
 from rag_core.worker.health import check_worker_health
 
 
 app = FastAPI(title="rag-core", version="0.1.0")
+
+logger = logging.getLogger(__name__)
 
 
 def _health_response(payload: dict[str, Any]) -> JSONResponse:
@@ -583,6 +587,7 @@ async def document_create(
 
     # ── Enqueue async ingestion when Celery is enabled (Phase 5) ─────────
     enqueued = False
+    ingested_sync = False
     settings_for_enqueue = get_service_settings()
     if settings_for_enqueue.celery_enabled:
         try:
@@ -600,17 +605,43 @@ async def document_create(
             # explicit enqueue happens.
             pass
 
+    # ── Synchronous ingestion fallback (no Celery needed) ──────────────
+    # When Celery is disabled and RAG_CORE_SYNC_INGESTION_ENABLED=true,
+    # run the full ingestion pipeline inline within this request.
+    # This is the Dominion Life live-indexing path: upload → immediately
+    # indexed into Qdrant without a background worker.
+    if not enqueued and settings_for_enqueue.sync_ingestion_enabled:
+        try:
+            from rag_core.db.database import SessionLocal as SyncSessionLocal
+
+            sync_db = SyncSessionLocal()
+            try:
+                ingest_result = process_document_ingestion(
+                    result.document_id, result.job_id, sync_db, settings=settings_for_enqueue,
+                )
+                ingested_sync = bool(ingest_result.get("status") == "completed")
+                if not ingested_sync:
+                    logger.warning(
+                        "Synchronous ingestion returned non-completed status for doc %s (job %s): %s",
+                        result.document_id, result.job_id, ingest_result.get("status"),
+                    )
+            finally:
+                sync_db.close()
+        except Exception:
+            logger.exception("Synchronous ingestion failed for document %s (job %s)", result.document_id, result.job_id)
+
     return DocumentIntakeResponse(
         document_id=result.document_id,
         job_id=result.job_id,
-        status=result.status if not enqueued else "queued",
+        status="completed" if ingested_sync else (result.status if not enqueued else "queued"),
         collection_id=result.collection_id,
         collection_name=result.collection_name,
         source_uri=result.source_uri,
         storage=storage_payload,
-        metadata_json=result.metadata_json if not enqueued else {
+        metadata_json={
             **result.metadata_json,
             "_celery_enqueued": enqueued,
+            "_sync_ingested": ingested_sync,
         },
     )
 

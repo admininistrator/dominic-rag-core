@@ -125,6 +125,14 @@ class RagCoreServiceSettings:
     # rag-core Celery app name: "rag_core". Queue namespace: "rag.*".
     # RAG_CORE_CELERY_ENABLED defaults False — API starts without a worker process.
     celery_enabled: bool = False                              # RAG_CORE_CELERY_ENABLED
+
+    # Synchronous ingestion fallback — runs the full ingestion pipeline inline
+    # within the upload HTTP request when Celery is disabled.
+    # Enable with RAG_CORE_SYNC_INGESTION_ENABLED=true in dl-rag-core.env.
+    # When both celery_enabled and sync_ingestion_enabled are true, Celery takes
+    # priority (async dispatch used instead of inline processing).
+    # Backward-compatible default: False — existing DominicBE behavior unchanged.
+    sync_ingestion_enabled: bool = False                      # RAG_CORE_SYNC_INGESTION_ENABLED
     celery_broker_url: str = "redis://127.0.0.1:6379/2"      # RAG_CORE_CELERY_BROKER_URL
     celery_result_backend: str = "redis://127.0.0.1:6379/3"  # RAG_CORE_CELERY_RESULT_BACKEND
     celery_app_name: str = "rag_core"                         # RAG_CORE_CELERY_APP_NAME
@@ -250,6 +258,7 @@ def get_service_settings() -> RagCoreServiceSettings:
         db_ssl=_env_bool("RAG_CORE_DB_SSL", False),
         # RCSI-P1-T02: Redis/Celery config
         celery_enabled=_env_bool("RAG_CORE_CELERY_ENABLED", False),
+        sync_ingestion_enabled=_env_bool("RAG_CORE_SYNC_INGESTION_ENABLED", False),
         celery_broker_url=_env_str("RAG_CORE_CELERY_BROKER_URL", "redis://127.0.0.1:6379/2"),
         celery_result_backend=_env_str("RAG_CORE_CELERY_RESULT_BACKEND", "redis://127.0.0.1:6379/3"),
         celery_app_name=_env_str("RAG_CORE_CELERY_APP_NAME", "rag_core"),
